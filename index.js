@@ -16,9 +16,58 @@ const { Image } = require("./models/images");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+function getAllowedFrontendOrigins() {
+  return String(process.env.FRONTEND_URLS || process.env.FRONTEND_URL || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function isAllowedFrontendOrigin(origin) {
+  if (!origin) return false;
+  const allowed = getAllowedFrontendOrigins();
+  return allowed.includes(origin);
+}
+
+function getRequestFrontendOrigin(req) {
+  // Prefer explicit query (useful for local dev), otherwise use Origin/Referer.
+  const fromQuery = typeof req.query.frontend === "string" ? req.query.frontend : null;
+  if (fromQuery && isAllowedFrontendOrigin(fromQuery)) return fromQuery;
+
+  const origin = req.get("origin");
+  if (origin && isAllowedFrontendOrigin(origin)) return origin;
+
+  const referer = req.get("referer");
+  if (referer) {
+    try {
+      const parsed = new URL(referer);
+      const refererOrigin = parsed.origin;
+      if (isAllowedFrontendOrigin(refererOrigin)) return refererOrigin;
+    } catch {
+      // ignore
+    }
+  }
+
+  return null;
+}
+
+function getBackendBaseUrl(req) {
+  // Works for local dev + behind proxies (Render/Vercel/etc).
+  const proto = req.get("x-forwarded-proto") || req.protocol;
+  const host = req.get("x-forwarded-host") || req.get("host");
+  if (proto && host) return `${proto}://${host}`;
+  return process.env.BACKEND_URL;
+}
+
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL,
+    origin: (origin, callback) => {
+      // allow non-browser clients (no Origin header)
+      if (!origin) return callback(null, true);
+      return isAllowedFrontendOrigin(origin)
+        ? callback(null, true)
+        : callback(new Error("Not allowed by CORS"));
+    },
     credentials: true,
   })
 );
@@ -91,7 +140,9 @@ app.get("/", (req, res) => {
 // Google OAuth
 
 app.get("/auth/google", (req, res) => {
-  const redirectUri = `${process.env.BACKEND_URL}/auth/google/callback`;
+  const redirectUri = `${getBackendBaseUrl(req)}/auth/google/callback`;
+  const frontendOrigin = getRequestFrontendOrigin(req);
+  const state = frontendOrigin ? encodeURIComponent(frontendOrigin) : "";
 
   const googleAuthUrl =
     `https://accounts.google.com/o/oauth2/v2/auth?` +
@@ -99,20 +150,21 @@ app.get("/auth/google", (req, res) => {
     `redirect_uri=${encodeURIComponent(redirectUri)}&` +
     `response_type=code&` +
     `scope=${encodeURIComponent("openid email profile")}&` +
-    `access_type=offline&prompt=consent`;
+    `access_type=offline&prompt=consent` +
+    (state ? `&state=${state}` : "");
 
   res.redirect(googleAuthUrl);
 });
 
 app.get("/auth/google/callback", async (req, res) => {
   try {
-    const { code } = req.query;
+    const { code, state } = req.query;
 
     if (!code) {
       return res.status(400).send("Authorization code not provided.");
     }
 
-    const redirectUri = `${process.env.BACKEND_URL}/auth/google/callback`;
+    const redirectUri = `${getBackendBaseUrl(req)}/auth/google/callback`;
 
     const params = new URLSearchParams();
     params.append("client_id", process.env.GOOGLE_CLIENT_ID);
@@ -165,7 +217,19 @@ await user.save();
 
     const appToken = generateToken(user);
 
-    return res.redirect(`${process.env.FRONTEND_URL}/?token=${appToken}`);
+    let redirectBase = process.env.FRONTEND_URL;
+    if (typeof state === "string" && state) {
+      try {
+        const decoded = decodeURIComponent(state);
+        if (isAllowedFrontendOrigin(decoded)) {
+          redirectBase = decoded;
+        }
+      } catch {
+        // ignore invalid state
+      }
+    }
+
+    return res.redirect(`${redirectBase}/?token=${appToken}`);
   } catch (error) {
     console.error("Google auth error:", error.response?.data || error.message);
     return res.status(500).send("Authentication failed.");
